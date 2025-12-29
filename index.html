@@ -825,8 +825,8 @@ function parseSeasonAndHabits(md) {
 function parseHabitsFromLog(logContent) {
   habitsCompletedToday = [];
   const lines = logContent.split('\n');
-  const today = new Date();
-  const todayStr = `${String(today.getDate()).padStart(2, '0')}.${String(today.getMonth() + 1).padStart(2, '0')}`;
+  const d = getEffectiveDate();
+  const todayStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
   let inToday = false;
   
   for (const line of lines) {
@@ -848,8 +848,8 @@ function parseHabitsFromLog(logContent) {
 }
 
 function parseFocusFromLog(logContent) {
-  const today = new Date();
-  const todayStr = `${String(today.getDate()).padStart(2, '0')}.${String(today.getMonth() + 1).padStart(2, '0')}`;
+  const d = getEffectiveDate();
+  const todayStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
   let inToday = false, totalMins = 0;
   
   for (const line of logContent.split('\n')) {
@@ -1123,31 +1123,35 @@ function getPlannedMovement() {
 
 function updateMovementDisplay() {
   const available = getAvailableMovement();
-  const planned = getPlannedMovement();
-  const remaining = available - planned;
   const data = getMovementData();
+  const plannedCost = data.plannedTasks.reduce((sum, p) => sum + (MOVEMENT_COSTS[p.type] || 0), 0);
+  const usedToday = data.usedToday || 0;
+  
+  // Realnie pozostałe (tylko zużyte)
+  const realRemaining = available - usedToday;
   
   const valueEl = document.getElementById('movementValue');
   const debtBadge = document.getElementById('movementDebtBadge');
   
-  if (remaining < 0) {
-    valueEl.textContent = `${remaining}/${available}`;
-    valueEl.className = 'movement-value debt';
-    debtBadge.textContent = `DŁUG: ${Math.abs(remaining)}`;
-    debtBadge.classList.remove('hidden');
-  } else if (remaining <= 4) {
-    valueEl.textContent = `${remaining}/${available}`;
-    valueEl.className = 'movement-value low';
-    debtBadge.classList.add('hidden');
-  } else {
-    valueEl.textContent = `${remaining}/${available}`;
-    valueEl.className = 'movement-value normal';
-    debtBadge.classList.add('hidden');
-  }
+  if (!valueEl) return;
   
-  if (data.debt > 0 && remaining >= 0) {
-    debtBadge.textContent = `wczoraj: -${data.debt}`;
-    debtBadge.classList.remove('hidden');
+  // Kolor dla realRemaining
+  let realColor = 'normal';
+  if (realRemaining <= 0) realColor = 'debt';
+  else if (realRemaining <= 4) realColor = 'low';
+  
+  // Format: 1 (-10) /12 - gdzie -10 to suma zaplanowanych
+  const pinsDisplay = plannedCost > 0 ? ` <span style="color:${plannedCost > realRemaining ? '#f87171' : '#eab308'}">(-${plannedCost})</span>` : '';
+  valueEl.innerHTML = `<span class="movement-value ${realColor}">${realRemaining}</span>${pinsDisplay} <span style="color:#6b7280">/${available}</span>`;
+  
+  // Badge długu z wczoraj
+  if (debtBadge) {
+    if (data.debt > 0) {
+      debtBadge.textContent = `dług: ${data.debt}`;
+      debtBadge.classList.remove('hidden');
+    } else {
+      debtBadge.classList.add('hidden');
+    }
   }
 }
 
@@ -1566,13 +1570,24 @@ async function confirmDone() {
   try {
     const lines = currentMd.split('\n'), comment = document.getElementById('doneComment').value.trim();
     const waitingFor = document.getElementById('doneWaitingFor').value.trim();
+    
+    // Usuń z plannedTasks i pobierz koszt
+    const { wasPlanned, cost: movementCost } = checkAndRemovePlannedTask(selectedTask.taskId, selectedTask.taskType);
+    
     lines.splice(selectedTask.lineNum, 1);
-    if (waitingFor) { const wIdx = lines.findIndex(l => l.includes('Czekam na') && l.startsWith('##')); if (wIdx >= 0) { const d = new Date(); const dateStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`; lines.splice(wIdx + 1, 0, `- ${waitingFor} @${selectedTask.tag || 'general'} (${dateStr})`); } }
+    if (waitingFor) { const wIdx = lines.findIndex(l => l.includes('Czekam na') && l.startsWith('##')); if (wIdx >= 0) { const d = getEffectiveDate(); const dateStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`; lines.splice(wIdx + 1, 0, `- ${waitingFor} @${selectedTask.tag || 'general'} (${dateStr})`); } }
     const newMd = lines.join('\n');
     const result = await saveFile('current.md', newMd, currentSha, `[MOBILE] Done`);
     currentSha = result.content.sha; currentMd = newMd;
     const emoji = TASK_TYPES[selectedTask.type];
     await addToLog(`[DONE] ${emoji} ${stripTaskTypeEmoji(selectedTask.text).replace(/@[a-z0-9-]+/g, '').trim()} @${selectedTask.tag || 'general'}${comment ? ' — ' + comment : ''}`);
+    
+    // Movement points - ZAWSZE dodaj koszt
+    const data = getMovementData();
+    data.usedToday = (data.usedToday || 0) + movementCost;
+    saveMovementData(data);
+    updateMovementDisplay();
+    
     trackTask(selectedTask.type);
     render(); showToast('Zrobione! 🎉');
   } catch (err) { showToast('Błąd: ' + err.message); }
@@ -1587,9 +1602,13 @@ async function confirmDoneWithNextTask(quadrant) {
     const lines = currentMd.split('\n'), comment = document.getElementById('doneComment').value.trim();
     const waitingFor = document.getElementById('doneWaitingFor').value.trim();
     const nextDesc = document.getElementById('doneNextTaskDesc').value.trim();
+    
+    // Usuń z plannedTasks i pobierz koszt
+    const { wasPlanned, cost: movementCost } = checkAndRemovePlannedTask(selectedTask.taskId, selectedTask.taskType);
+    
     lines.splice(selectedTask.lineNum, 1);
-    if (waitingFor) { const wIdx = lines.findIndex(l => l.includes('Czekam na') && l.startsWith('##')); if (wIdx >= 0) { const d = new Date(); const dateStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`; lines.splice(wIdx + 1, 0, `- ${waitingFor} @${selectedTask.tag || 'general'} (${dateStr})`); } }
-    const emoji = TASK_TYPES[doneTaskType], today = new Date().toISOString().split('T')[0];
+    if (waitingFor) { const wIdx = lines.findIndex(l => l.includes('Czekam na') && l.startsWith('##')); if (wIdx >= 0) { const d = getEffectiveDate(); const dateStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`; lines.splice(wIdx + 1, 0, `- ${waitingFor} @${selectedTask.tag || 'general'} (${dateStr})`); } }
+    const emoji = TASK_TYPES[doneTaskType], today = getEffectiveDateKey();
     const taskLine = `- [ ] ${emoji} ${nextTask} @${selectedTask.tag || 'general'}${nextDesc ? ` <!-- ${nextDesc} | CR:${today} -->` : ` <!-- | CR:${today} -->`}`;
     const headers = { dzialaj: '🔴 DZIAŁAJ', plan: '🟡 ZAPLANUJ', delegate: '🔵 DELEGUJ', backlog: '⚪ BACKLOG' };
     for (let i = 0; i < lines.length; i++) { if (lines[i].includes(headers[quadrant])) { let ins = i + 1; while (ins < lines.length && !lines[ins].startsWith('- [')) ins++; lines.splice(ins, 0, taskLine); break; } }
@@ -1599,6 +1618,13 @@ async function confirmDoneWithNextTask(quadrant) {
     const oldEmoji = TASK_TYPES[selectedTask.type];
     await addToLog(`[DONE] ${oldEmoji} ${stripTaskTypeEmoji(selectedTask.text).replace(/@[a-z0-9-]+/g, '').trim()} @${selectedTask.tag || 'general'}${comment ? ' — ' + comment : ''}`);
     await addToLog(`[TASK] ${emoji} ${nextTask} @${selectedTask.tag || 'general'}`);
+    
+    // Movement points - ZAWSZE dodaj koszt
+    const data = getMovementData();
+    data.usedToday = (data.usedToday || 0) + movementCost;
+    saveMovementData(data);
+    updateMovementDisplay();
+    
     trackTask(selectedTask.type);
     render(); showToast('Zrobione + nowy! 🎉');
   } catch (err) { showToast('Błąd: ' + err.message); }
@@ -1815,6 +1841,37 @@ async function reloadLogs() {
 function getDailyStats() { const k = getEffectiveDateKey(), stored = localStorage.getItem('frogStats'), stats = stored ? JSON.parse(stored) : {}; if (stats.date !== k) { stats.date = k; stats.frogs = 0; stats.comms = 0; stats.focus = 0; localStorage.setItem('frogStats', JSON.stringify(stats)); } return stats; }
 function saveDailyStats(stats) { localStorage.setItem('frogStats', JSON.stringify(stats)); }
 function trackTask(type) { const stats = getDailyStats(); if (type === 'turbo' || type === 'frog' || type === 'delegate') stats.frogs++; else stats.comms++; saveDailyStats(stats); updateStatsDisplay(); checkMaxDay(); }
+
+// Synchronizuj liczniki z logu - log jest źródłem prawdy
+function syncFrogCountersFromLog(logContent) {
+  if (!logContent) return;
+  const d = getEffectiveDate();
+  const todayStr = `## ${String(d.getDate()).padStart(2,'0')}.${String(d.getMonth()+1).padStart(2,'0')}`;
+  const lines = logContent.split('\n');
+  let inToday = false;
+  let logFrogs = 0, logComms = 0, focusMins = 0;
+  
+  for (const line of lines) {
+    if (line.startsWith(todayStr)) { inToday = true; continue; }
+    if (inToday && line.startsWith('## ') && !line.startsWith(todayStr)) break;
+    if (inToday && line.includes('[DONE]')) {
+      if (line.includes('🐸') || line.includes('🔥') || line.includes('📤')) logFrogs++;
+      else if (line.includes('👀') || line.includes('💬') || line.includes('🏃')) logComms++;
+    }
+    if (inToday && line.includes('[FOCUS]')) {
+      const minMatch = line.match(/(\d+)min/);
+      if (minMatch) focusMins += parseInt(minMatch[1]);
+    }
+  }
+  
+  // Ustaw wartości z logu
+  const stats = getDailyStats();
+  stats.frogs = logFrogs;
+  stats.comms = logComms;
+  stats.focus = focusMins;
+  saveDailyStats(stats);
+}
+
 function updateStatsDisplay() {
   const stats = getDailyStats();
   let fH = ''; for (let i = 0; i < 3; i++) fH += i < stats.frogs ? '🐸' : '<span class="dim">🐸</span>'; if (stats.frogs > 3) fH += `<span style="font-size:11px;color:#eab308;">+${stats.frogs - 3}</span>`;
@@ -1854,6 +1911,7 @@ async function loadData() {
       const logData = await fetchFile(logPath);
       logsData[logPath] = logData.content;
       parseHabitsFromLog(logData.content);
+      syncFrogCountersFromLog(logData.content);
     } catch { logsData[logPath] = ''; }
     
     renderSeasonBar();
