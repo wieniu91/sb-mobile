@@ -250,6 +250,13 @@
     .loading-spinner { width: 40px; height: 40px; border: 3px solid #374151; border-top-color: #60a5fa; border-radius: 50%; animation: spin 1s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
     @keyframes movementPop { 0% { opacity: 0; transform: translateY(0); } 20% { opacity: 1; } 100% { opacity: 0; transform: translateY(-30px); } }
+    
+    /* Night Mode */
+    .night-mode-btn { padding: 6px 10px; border-radius: 8px; font-size: 18px; cursor: pointer; transition: all 0.15s; border: 1px solid transparent; background: transparent; }
+    .night-mode-btn.night-active { background: rgba(251, 191, 36, 0.2); border-color: #f59e0b; }
+    .night-banner { background: linear-gradient(90deg, rgba(251, 191, 36, 0.15), rgba(251, 191, 36, 0.05)); border: 1px solid rgba(251, 191, 36, 0.3); border-radius: 8px; padding: 10px 14px; margin: 8px 12px; font-size: 13px; color: #fbbf24; display: flex; align-items: center; gap: 8px; }
+    .night-banner.hidden { display: none; }
+    
     .toast { position: fixed; bottom: 100px; left: 50%; transform: translateX(-50%); background: #22c55e; color: white; padding: 12px 24px; border-radius: 12px; font-size: 14px; font-weight: 600; z-index: 150; opacity: 0; transition: opacity 0.3s; }
     .toast.active { opacity: 1; }
     .backdrop { position: fixed; inset: 0; z-index: 90; display: none; }
@@ -282,6 +289,7 @@
           </div>
         </div>
         <div class="header-actions">
+          <button class="night-mode-btn" id="nightModeBtn" onclick="toggleNightModeManual()">☀️</button>
           <button class="header-btn filter-toggle" id="filterToggle" onclick="toggleFilters()">▼</button>
           <button class="header-btn" onclick="loadData()">🔄</button>
           <button class="header-btn" onclick="logout()">🚪</button>
@@ -298,6 +306,9 @@
         <button class="season-filter-btn active" id="seasonFilterBtn" onclick="toggleSeasonFilter()">📌 Sezon</button>
         <button class="season-filter-btn" id="plannedFilterBtn" onclick="togglePlannedFilter()">📍 Plan</button>
       </div>
+      
+      <!-- Night Mode Banner -->
+      <div id="nightModeBanner" class="night-banner hidden"></div>
       
       <!-- Habits bar -->
       <div class="habits-bar" id="habitsBar"></div>
@@ -343,6 +354,7 @@
           <div class="filter-row" id="filterCategories">
             <button class="filter-btn active" data-cat="all" onclick="setCategoryFilter('all')">🌐</button>
             <button class="filter-btn" data-cat="produkcja" onclick="setCategoryFilter('produkcja')">🎬<span class="count zero"></span></button>
+            <button class="filter-btn" data-cat="fabularne" onclick="setCategoryFilter('fabularne')">🎭<span class="count zero"></span></button>
             <button class="filter-btn" data-cat="biznes" onclick="setCategoryFilter('biznes')">💼<span class="count zero"></span></button>
             <button class="filter-btn" data-cat="rozwoj" onclick="setCategoryFilter('rozwoj')">📚<span class="count zero"></span></button>
             <button class="filter-btn" data-cat="rodzina" onclick="setCategoryFilter('rodzina')">👨‍👩‍👦<span class="count zero"></span></button>
@@ -678,6 +690,60 @@ function isNightModeActive() {
   if (manualMode === 'on') return true;
   if (manualMode === 'off') return false;
   return isAutoNightMode();
+}
+
+function toggleNightModeManual() {
+  const current = localStorage.getItem('nightModeManual');
+  if (current === 'on') {
+    localStorage.removeItem('nightModeManual');
+  } else if (current === 'off') {
+    localStorage.setItem('nightModeManual', 'on');
+  } else {
+    if (isAutoNightMode()) {
+      localStorage.setItem('nightModeManual', 'off');
+    } else {
+      localStorage.setItem('nightModeManual', 'on');
+    }
+  }
+  
+  updateNightModeDisplay();
+  
+  // Resetuj flagę carriedChecked dla nowego efektywnego dnia
+  const effectiveKey = getEffectiveDateKey();
+  const storageKey = getMovementStorageKey(effectiveKey);
+  const stored = localStorage.getItem(storageKey);
+  if (stored) {
+    const data = JSON.parse(stored);
+    data.carriedChecked = false;
+    localStorage.setItem(storageKey, JSON.stringify(data));
+  }
+  
+  // Przeładuj dane dla nowej efektywnej daty
+  loadData();
+}
+
+function updateNightModeDisplay() {
+  const isNight = isNightModeActive();
+  const isManual = localStorage.getItem('nightModeManual');
+  const btn = document.getElementById('nightModeBtn');
+  const banner = document.getElementById('nightModeBanner');
+  
+  if (btn) {
+    btn.textContent = isNight ? '🌙' : '☀️';
+    btn.title = isNight ? 'Tryb nocny aktywny' : 'Tryb dzienny';
+    btn.classList.toggle('night-active', isNight);
+  }
+  
+  if (banner) {
+    if (isNight) {
+      const effectiveDate = getEffectiveDate();
+      const dateStr = `${String(effectiveDate.getDate()).padStart(2,'0')}.${String(effectiveDate.getMonth()+1).padStart(2,'0')}`;
+      banner.innerHTML = `🌙 Tryb nocny — akcje liczą się na <strong>${dateStr}</strong>${isManual ? ' <span style="font-size:10px;opacity:0.7">(manual)</span>' : ''}`;
+      banner.classList.remove('hidden');
+    } else {
+      banner.classList.add('hidden');
+    }
+  }
 }
 
 function getEffectiveDate() {
@@ -1230,7 +1296,7 @@ function updateFilterCounts(tasks, all) {
   const tC = { all: all.length }; all.forEach(t => { tC[t.taskType] = (tC[t.taskType] || 0) + 1; });
   document.querySelectorAll('#filterTypes .filter-btn').forEach(b => { const c = b.querySelector('.count'); if (c) { const cnt = tC[b.dataset.type] || 0; c.textContent = cnt; c.classList.toggle('zero', cnt === 0); } });
   // Kategorie
-  const catC = { all: all.length, produkcja: 0, biznes: 0, rozwoj: 0, rodzina: 0 };
+  const catC = { all: all.length, produkcja: 0, fabularne: 0, biznes: 0, rozwoj: 0, rodzina: 0 };
   all.forEach(t => { const cat = t.tag ? getProjectCategory(t.tag) : 'produkcja'; catC[cat] = (catC[cat] || 0) + 1; });
   document.querySelectorAll('#filterCategories .filter-btn').forEach(b => { const c = b.querySelector('.count'); if (c) { const cnt = catC[b.dataset.cat] || 0; c.textContent = cnt; c.classList.toggle('zero', cnt === 0); } });
 }
@@ -1793,6 +1859,7 @@ async function loadData() {
     renderSeasonBar();
     renderHabits();
     renderFocusBar();
+    updateNightModeDisplay();
     getMovementData(); // Initialize movement data
     updateMovementDisplay();
     render();
