@@ -606,6 +606,10 @@ let habits = [], habitsCompletedToday = [], habitStreaks = {};
 let season = { main: null, deadline: null, secondary: [] };
 let maxDayTriggered = false;
 
+// Movement sync przez GitHub
+let movementData = null;
+let movementSha = null;
+
 const TASK_TYPES = { turbo: '🔥', frog: '🐸', delegate: '📤', feedback: '👀', comm: '💬', errand: '🏃' };
 const PROJECT_CATEGORIES = { 
   hollylook: 'produkcja', bajkotek: 'biznes', 'szkolenia-ai': 'biznes', 
@@ -971,6 +975,8 @@ function generateTaskId() {
   return Math.random().toString(16).substring(2, 8);
 }
 
+// === MOVEMENT POINTS - sync przez GitHub ===
+
 function getYesterdayKey(todayKey) {
   const [y, m, d] = todayKey.split('-').map(Number);
   const date = new Date(y, m - 1, d);
@@ -978,121 +984,105 @@ function getYesterdayKey(todayKey) {
   return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
 }
 
-// === MOVEMENT POINTS - osobne dane per dzień (localStorage) ===
+async function fetchMovementData() {
+  try {
+    const res = await fetch(`https://api.github.com/repos/${REPO}/contents/movement.json`, {
+      headers: { Authorization: `token ${GITHUB_TOKEN}` }
+    });
+    if (!res.ok) {
+      movementData = { currentDate: getEffectiveDateKey(), debt: 0, plannedTasks: [], usedToday: 0, history: {} };
+      movementSha = null;
+      return;
+    }
+    const data = await res.json();
+    movementSha = data.sha;
+    const content = JSON.parse(decodeUTF8(data.content));
+    
+    const today = getEffectiveDateKey();
+    
+    // Jeśli data się zmieniła, przenieś dane do historii i zresetuj na nowy dzień
+    if (content.currentDate !== today) {
+      if (content.currentDate) {
+        content.history = content.history || {};
+        content.history[content.currentDate] = {
+          debt: content.debt,
+          plannedTasks: content.plannedTasks,
+          usedToday: content.usedToday
+        };
+        const keys = Object.keys(content.history).sort().reverse();
+        if (keys.length > 7) keys.slice(7).forEach(k => delete content.history[k]);
+      }
+      
+      // Oblicz dług z wczoraj (tylko usedToday, nie pinezki)
+      const yesterdayUsed = content.usedToday || 0;
+      const newDebt = yesterdayUsed > BASE_MOVEMENT_POINTS ? yesterdayUsed - BASE_MOVEMENT_POINTS : 0;
+      
+      // Przenieś nieukończone pinezki
+      const carriedTasks = (content.plannedTasks || []).map(p => ({ ...p, carriedFrom: content.currentDate }));
+      
+      content.currentDate = today;
+      content.debt = newDebt;
+      content.plannedTasks = carriedTasks;
+      content.usedToday = 0;
+      
+      await saveMovementDataToGitHub(content);
+    }
+    
+    movementData = content;
+  } catch (e) {
+    console.error('Error fetching movement data:', e);
+    movementData = { currentDate: getEffectiveDateKey(), debt: 0, plannedTasks: [], usedToday: 0, history: {} };
+  }
+  
+  plannedTasks = new Set((movementData.plannedTasks || []).map(p => p.taskId));
+}
 
-function getMovementStorageKey(dateKey) {
-  return `sb_movement_${dateKey}`;
+async function saveMovementDataToGitHub(data) {
+  try {
+    const content = JSON.stringify(data, null, 2);
+    const bytes = new TextEncoder().encode(content);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    
+    const body = {
+      message: '[MOBILE] Update movement',
+      content: btoa(binary)
+    };
+    if (movementSha) body.sha = movementSha;
+    
+    const res = await fetch(`https://api.github.com/repos/${REPO}/contents/movement.json`, {
+      method: 'PUT',
+      headers: { Authorization: `token ${GITHUB_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    
+    if (res.ok) {
+      const result = await res.json();
+      movementSha = result.content.sha;
+      movementData = data;
+    }
+  } catch (e) {
+    console.error('Error saving movement:', e);
+  }
 }
 
 function getMovementData() {
-  const effectiveKey = getEffectiveDateKey();
-  const storageKey = getMovementStorageKey(effectiveKey);
-  const stored = localStorage.getItem(storageKey);
-  
-  let data;
-  
-  if (stored) {
-    data = JSON.parse(stored);
-    // Migracja: jeśli stare dane mają lineNum zamiast taskId, wyczyść
-    if (data.plannedTasks?.length > 0 && data.plannedTasks[0].lineNum !== undefined && !data.plannedTasks[0].taskId) {
-      data.plannedTasks = [];
-    }
-  } else {
-    // Nowy dzień - inicjalizuj puste dane
-    data = { 
-      date: effectiveKey, 
-      debt: 0, 
-      plannedTasks: [],
-      usedToday: 0,
-      carriedChecked: false
-    };
+  if (!movementData) {
+    movementData = { currentDate: getEffectiveDateKey(), debt: 0, plannedTasks: [], usedToday: 0, history: {} };
   }
-  
-  // ZAWSZE sprawdź czy są nowe pinezki z wczoraj do przeniesienia
-  if (!data.carriedChecked) {
-    const yesterdayKey = getYesterdayKey(effectiveKey);
-    const yesterdayStorageKey = getMovementStorageKey(yesterdayKey);
-    const yesterdayData = localStorage.getItem(yesterdayStorageKey);
-    
-    if (yesterdayData) {
-      const yd = JSON.parse(yesterdayData);
-      const existingTaskIds = new Set(data.plannedTasks.map(p => p.taskId));
-      
-      // Dodaj pinezki z wczoraj których jeszcze nie ma
-      for (const p of (yd.plannedTasks || [])) {
-        if (p.taskId && !existingTaskIds.has(p.taskId)) {
-          data.plannedTasks.push({
-            ...p,
-            carriedFrom: yesterdayKey
-          });
-        }
-      }
-      
-      // Oblicz dług jeśli wczoraj ZREALIZOWANO ponad limit
-      // WAŻNE: Tylko usedToday, NIE plannedCost!
-      if (data.debt === 0) {
-        const yesterdayUsed = yd.usedToday || 0;
-        if (yesterdayUsed > BASE_MOVEMENT_POINTS) {
-          data.debt = yesterdayUsed - BASE_MOVEMENT_POINTS;
-        }
-      }
-    }
-    
-    // Migracja ze starego formatu (jeden klucz movementData)
-    const oldData = localStorage.getItem('movementData');
-    if (oldData) {
-      const od = JSON.parse(oldData);
-      if (od.date === effectiveKey) {
-        data.debt = od.debt || data.debt;
-        data.usedToday = od.usedToday || data.usedToday;
-        for (const p of (od.plannedTasks || [])) {
-          if (p.taskId && !data.plannedTasks.some(x => x.taskId === p.taskId)) {
-            data.plannedTasks.push(p);
-          }
-        }
-      }
-      localStorage.removeItem('movementData');
-    }
-    
-    data.carriedChecked = true;
-    localStorage.setItem(storageKey, JSON.stringify(data));
-  }
-  
-  plannedTasks = new Set(data.plannedTasks.map(p => p.taskId));
-  return data;
+  plannedTasks = new Set((movementData.plannedTasks || []).map(p => p.taskId));
+  return movementData;
 }
 
-function saveMovementData(data) {
-  const effectiveKey = getEffectiveDateKey();
-  const storageKey = getMovementStorageKey(effectiveKey);
-  data.date = effectiveKey;
-  localStorage.setItem(storageKey, JSON.stringify(data));
-  plannedTasks = new Set(data.plannedTasks.map(p => p.taskId));
-}
-
-// Walidacja pinezek - usuwa "osieroce" pinezki dla tasków które już nie istnieją
-function validatePlannedTasks(existingTaskIds) {
-  const data = getMovementData();
-  const validTaskIds = new Set(existingTaskIds);
-  const originalCount = data.plannedTasks.length;
-  
-  // Filtruj tylko pinezki dla istniejących tasków
-  data.plannedTasks = data.plannedTasks.filter(p => {
-    if (!p.taskId) return false;
-    if (!validTaskIds.has(p.taskId)) return false;
-    return true;
-  });
-  
-  // Jeśli coś usunięto, zapisz
-  if (data.plannedTasks.length !== originalCount) {
-    saveMovementData(data);
-  }
+async function saveMovementData(data) {
+  movementData = data;
+  plannedTasks = new Set((data.plannedTasks || []).map(p => p.taskId));
+  await saveMovementDataToGitHub(data);
 }
 
 async function togglePlanTask(taskId, taskType, event, lineNum) {
   event.stopPropagation();
   
-  // Jeśli task nie ma ID, wygeneruj je i zapisz do pliku
   if (!taskId && lineNum !== undefined) {
     const newId = generateTaskId();
     showLoading();
@@ -1101,7 +1091,6 @@ async function togglePlanTask(taskId, taskType, event, lineNum) {
       const lines = f.content.split('\n');
       const line = lines[lineNum];
       
-      // Dodaj ID do komentarza
       if (line.includes('<!--')) {
         lines[lineNum] = line.replace(/<!--\s*/, `<!-- id:${newId} | `);
       } else {
@@ -1130,33 +1119,13 @@ async function togglePlanTask(taskId, taskType, event, lineNum) {
   
   if (isRemoving) {
     data.plannedTasks.splice(idx, 1);
-    // Usuń też z wczoraj jeśli tam była (żeby nie przeniosła się ponownie)
-    removeTaskFromYesterday(taskId);
   } else {
     data.plannedTasks.push({ taskId, type: taskType });
   }
   
-  saveMovementData(data);
+  await saveMovementData(data);
   updateMovementDisplay();
   render();
-}
-
-// Usuwa pinezkę z danych wczoraj (żeby nie przenosiła się ponownie)
-function removeTaskFromYesterday(taskId) {
-  if (!taskId) return;
-  const effectiveKey = getEffectiveDateKey();
-  const yesterdayKey = getYesterdayKey(effectiveKey);
-  const yesterdayStorageKey = getMovementStorageKey(yesterdayKey);
-  const yesterdayData = localStorage.getItem(yesterdayStorageKey);
-  
-  if (yesterdayData) {
-    const yd = JSON.parse(yesterdayData);
-    const idx = (yd.plannedTasks || []).findIndex(p => p.taskId === taskId);
-    if (idx > -1) {
-      yd.plannedTasks.splice(idx, 1);
-      localStorage.setItem(yesterdayStorageKey, JSON.stringify(yd));
-    }
-  }
 }
 
 function showMovementPopup(event, cost, isAdd) {
@@ -1186,7 +1155,6 @@ function updateMovementDisplay() {
   const plannedCost = data.plannedTasks.reduce((sum, p) => sum + (MOVEMENT_COSTS[p.type] || 0), 0);
   const usedToday = data.usedToday || 0;
   
-  // Realnie pozostałe (tylko zużyte)
   const realRemaining = available - usedToday;
   
   const valueEl = document.getElementById('movementValue');
@@ -1194,21 +1162,17 @@ function updateMovementDisplay() {
   
   if (!valueEl) return;
   
-  // Kolor dla realRemaining
   let realColor = 'normal';
   if (realRemaining <= 0) realColor = 'debt';
   else if (realRemaining <= 4) realColor = 'low';
   
-  // Kolor dla plannedCost
   let pinsColor = '#6b7280';
   if (plannedCost > realRemaining) pinsColor = '#f87171';
   else if (plannedCost > 0) pinsColor = '#eab308';
   
-  // Format: 1 (-10) /12 - gdzie -10 to suma zaplanowanych
   const pinsDisplay = plannedCost > 0 ? `-${plannedCost}` : '0';
   valueEl.innerHTML = `<span class="movement-value ${realColor}">${realRemaining}</span> <span style="color:${pinsColor}">(${pinsDisplay})</span> <span style="color:#6b7280">/${available}</span>`;
   
-  // Badge długu z wczoraj
   if (debtBadge) {
     if (data.debt > 0) {
       debtBadge.textContent = `dług: ${data.debt}`;
@@ -1219,8 +1183,7 @@ function updateMovementDisplay() {
   }
 }
 
-// Sprawdza i usuwa z planned - używa taskId
-function checkAndRemovePlannedTask(taskId, taskType) {
+async function checkAndRemovePlannedTask(taskId, taskType) {
   if (!taskId) return { wasPlanned: false, cost: MOVEMENT_COSTS[taskType] || 2 };
   const data = getMovementData();
   const idx = data.plannedTasks.findIndex(p => p.taskId === taskId);
@@ -1229,9 +1192,7 @@ function checkAndRemovePlannedTask(taskId, taskType) {
   
   if (wasPlanned) {
     data.plannedTasks.splice(idx, 1);
-    saveMovementData(data);
-    // Usuń też z wczoraj
-    removeTaskFromYesterday(taskId);
+    await saveMovementData(data);
   }
   
   return { wasPlanned, cost };
@@ -1620,7 +1581,7 @@ async function confirmDone() {
     const waitingFor = document.getElementById('doneWaitingFor').value.trim();
     
     // Usuń z plannedTasks i pobierz koszt
-    const { wasPlanned, cost: movementCost } = checkAndRemovePlannedTask(selectedTask.taskId, selectedTask.taskType);
+    const { wasPlanned, cost: movementCost } = await checkAndRemovePlannedTask(selectedTask.taskId, selectedTask.taskType);
     
     lines.splice(selectedTask.lineNum, 1);
     if (waitingFor) { const wIdx = lines.findIndex(l => l.includes('Czekam na') && l.startsWith('##')); if (wIdx >= 0) { const d = getEffectiveDate(); const dateStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`; lines.splice(wIdx + 1, 0, `- ${waitingFor} @${selectedTask.tag || 'general'} (${dateStr})`); } }
@@ -1633,7 +1594,7 @@ async function confirmDone() {
     // Movement points - ZAWSZE dodaj koszt
     const data = getMovementData();
     data.usedToday = (data.usedToday || 0) + movementCost;
-    saveMovementData(data);
+    await saveMovementData(data);
     updateMovementDisplay();
     
     trackTask(selectedTask.type);
@@ -1652,7 +1613,7 @@ async function confirmDoneWithNextTask(quadrant) {
     const nextDesc = document.getElementById('doneNextTaskDesc').value.trim();
     
     // Usuń z plannedTasks i pobierz koszt
-    const { wasPlanned, cost: movementCost } = checkAndRemovePlannedTask(selectedTask.taskId, selectedTask.taskType);
+    const { wasPlanned, cost: movementCost } = await checkAndRemovePlannedTask(selectedTask.taskId, selectedTask.taskType);
     
     lines.splice(selectedTask.lineNum, 1);
     if (waitingFor) { const wIdx = lines.findIndex(l => l.includes('Czekam na') && l.startsWith('##')); if (wIdx >= 0) { const d = getEffectiveDate(); const dateStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`; lines.splice(wIdx + 1, 0, `- ${waitingFor} @${selectedTask.tag || 'general'} (${dateStr})`); } }
@@ -1670,7 +1631,7 @@ async function confirmDoneWithNextTask(quadrant) {
     // Movement points - ZAWSZE dodaj koszt
     const data = getMovementData();
     data.usedToday = (data.usedToday || 0) + movementCost;
-    saveMovementData(data);
+    await saveMovementData(data);
     updateMovementDisplay();
     
     trackTask(selectedTask.type);
@@ -1972,7 +1933,7 @@ async function loadData() {
     renderHabits();
     renderFocusBar();
     updateNightModeDisplay();
-    getMovementData(); // Initialize movement data
+    await fetchMovementData(); // Pobierz dane movement z GitHub
     updateMovementDisplay();
     render();
     updateStatsDisplay();
